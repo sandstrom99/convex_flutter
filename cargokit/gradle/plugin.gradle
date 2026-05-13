@@ -134,11 +134,11 @@ class CargoKitPlugin implements Plugin<Project> {
 
             def platforms = com.flutter.gradle.FlutterPluginUtils.getTargetPlatforms(project).collect()
 
-            // Same thing addFlutterDependencies does in flutter.gradle
-            if (buildType == "debug") {
-                platforms.add("android-x86")
-                platforms.add("android-x64")
-            }
+            // VENDORED: upstream force-adds android-x86 + android-x64 here for
+            // debug builds (mirroring flutter.gradle's emulator support). Invyte
+            // only ships arm64-v8a, so compiling those wastes 60-90s of Rust
+            // cross-compile per debug iteration. To re-enable emulator builds,
+            // restore the upstream lines or pass --target-platform=android-x64.
 
             // The task name depends on plugin properties, which are not available
             // at this point
