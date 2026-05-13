@@ -1,6 +1,6 @@
 name: convex_flutter
 description: Multi-platform Convex backend integration for Flutter. Real-time WebSocket, subscriptions, auth, lifecycle management. Supports web (pure Dart) and native.
-version: 3.0.0
+version: 3.0.1
 repository: https://github.com/jkuldev/convex_flutter
 homepage: https://jkuldev.com
 
@@ -11,7 +11,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  flutter_rust_bridge: ^2.11.1
+  flutter_rust_bridge: 2.11.1  # exact pin — must match Cargo.toml + generated bindings
   flutter_web_plugins:
     sdk: flutter
   freezed_annotation: ^3.1.0
