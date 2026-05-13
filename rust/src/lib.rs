@@ -8,7 +8,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(debug_assertions)]
 use android_logger::Config;
 use async_once_cell::OnceCell;
 use convex::{
@@ -23,12 +22,26 @@ use futures::{
     channel::oneshot::{self, Sender},
     pin_mut, select_biased, FutureExt, StreamExt,
 };
-use log::debug; // Logging for debugging purposes
-#[cfg(debug_assertions)]
-use log::LevelFilter;
+use log::{debug, error, LevelFilter};
 use parking_lot::Mutex;
 use base64::Engine;
 use serde::Deserialize;
+
+/// Initialise android_logger.  The `tracing` crate is compiled with its
+/// `log` feature, so tracing events from the Convex SDK automatically
+/// fall through to the `log` crate (and thus to android_logger) when no
+/// tracing subscriber is installed.
+///
+/// When `verbose` is false only warnings and errors are emitted, keeping
+/// logcat quiet in normal operation.
+fn init_logging(verbose: bool) {
+    let level = if verbose {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Warn
+    };
+    android_logger::init_once(Config::default().with_max_level(level));
+}
 
 // Custom error type for Convex client operations, exposed to Dart.
 #[derive(Debug, thiserror::Error)]
@@ -185,14 +198,14 @@ impl QuerySubscriber for CallbackSubscriberDartFn {
     fn on_update(&self, value: String) {
         let future = (self.on_update)(value);
         tokio::spawn(async move {
-            let _ = future.await; // Await the future, ignoring the result
+            future.await;
         });
     }
 
     fn on_error(&self, message: String, value: Option<String>) {
         let future = (self.on_error)(message, value);
         tokio::spawn(async move {
-            let _ = future.await;
+            future.await;
         });
     }
 }
@@ -211,9 +224,8 @@ pub struct MobileConvexClient {
 impl MobileConvexClient {
     /// Creates a new MobileConvexClient instance with the given deployment URL and client ID.
     #[frb(sync)]
-    pub fn new(deployment_url: String, client_id: String) -> MobileConvexClient {
-        #[cfg(debug_assertions)]
-        android_logger::init_once(Config::default().with_max_level(LevelFilter::Error));
+    pub fn new(deployment_url: String, client_id: String, verbose_logging: bool) -> MobileConvexClient {
+        init_logging(verbose_logging);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -251,38 +263,28 @@ impl MobileConvexClient {
         &self,
         on_state_change: impl Fn(WebSocketConnectionState) -> DartFnFuture<()> + Send + Sync + 'static,
     ) -> Result<(), ClientError> {
-        println!("RUST: on_websocket_state_change() called");
+        debug!("on_websocket_state_change() called");
 
-        // Create tokio mpsc channel for receiving state changes from convex client
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<ConvexWebSocketState>(10);
-        println!("RUST: Created mpsc channel for state changes");
 
-        // Store sender for use when initializing the client
         {
             let mut sender = self.state_change_sender.lock();
             *sender = Some(state_tx);
-            println!("RUST: Stored state_tx in state_change_sender");
         }
 
-        // Spawn task to listen for state changes and call Dart callback
         let on_state_change = Arc::new(on_state_change);
-        println!("RUST: Spawning listener task for state changes");
         self.rt.spawn(async move {
-            println!("RUST: Listener task started, waiting for state changes");
+            debug!("WS state listener task started");
             while let Some(state) = state_rx.recv().await {
-                println!("RUST: Received state change from channel: {:?}", state);
+                debug!("WS state changed: {:?}", state);
                 let dart_state = WebSocketConnectionState::from(state);
-                println!("RUST: Converted to Dart state: {:?}", dart_state);
                 let callback = on_state_change.clone();
                 let future = (callback)(dart_state);
-                println!("RUST: Calling Dart callback");
                 let _ = future.await;
-                println!("RUST: Dart callback completed");
             }
-            println!("RUST: Listener task exiting (channel closed)");
+            debug!("WS state listener exiting (channel closed)");
         });
 
-        println!("RUST: on_websocket_state_change() returning");
         Ok(())
     }
 
@@ -291,31 +293,24 @@ impl MobileConvexClient {
         let url = self.deployment_url.clone();
         let state_sender = self.state_change_sender.lock().clone();
 
-        println!("RUST: connected_client() called with sender: {:?}", state_sender.is_some());
-
         self.client
             .get_or_try_init(async {
                 let client_id = self.client_id.to_owned();
 
-                // Build client directly without spawning a task
-                // This ensures callback is registered BEFORE connection starts
-                println!("RUST: Building ConvexClient directly (no task spawn)");
+                debug!("Building ConvexClient for {}", url);
                 let mut builder = ConvexClientBuilder::new(url.as_str())
                     .with_client_id(&client_id);
 
-                // Register state change callback BEFORE building
                 if let Some(sender) = state_sender {
-                    println!("RUST: Registering state change callback with builder");
                     builder = builder.with_on_state_change(sender);
                 } else {
-                    println!("RUST WARNING: No sender available - state changes will not be emitted");
+                    error!("No state_change sender — state changes will not be emitted");
                 }
 
-                println!("RUST: Calling builder.build() - connection will start now");
                 let result = builder.build().await;
                 match &result {
-                    Ok(_) => println!("RUST: ConvexClient built successfully"),
-                    Err(e) => println!("RUST ERROR: Failed to build ConvexClient: {:?}", e),
+                    Ok(_) => debug!("ConvexClient built successfully"),
+                    Err(e) => error!("Failed to build ConvexClient: {:?}", e),
                 }
                 result
             })

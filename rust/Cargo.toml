@@ -11,7 +11,8 @@ flutter_rust_bridge = "=2.11.1"
 tokio = { version = "1", features = ["full"] }
 android_logger = { version = "0.14.1" }
 log = { version = "0.4.21" }
-convex = { version = "0.10.3", features = ["rustls-tls-webpki-roots"] }
+tracing = { version = "0.1", features = ["log"] }
+convex = { version = "0.10.4", default-features = false, features = ["rustls-tls-webpki-roots"] }
 anyhow = { version = "1.0.86" }
 thiserror = { version = "1.0.61" }
 tokio-stream = { features = [ "io-util", "sync" ], version = "0.1" }
@@ -22,6 +23,9 @@ async-once-cell = { version = "0.5.3" }
 serde_json = { version = "1.0.120" }
 serde = { version = "1.0", features = ["derive"] }
 base64 = { version = "0.21" }
+# rustls needs an explicit crypto provider — tokio-tungstenite doesn't
+# enable one. Without this, TLS handshakes hang silently on Android.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
 

@@ -506,11 +506,13 @@ fn wire__crate__MobileConvexClient_new_impl(
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             let api_deployment_url = <String>::sse_decode(&mut deserializer);
             let api_client_id = <String>::sse_decode(&mut deserializer);
+            let api_verbose_logging = <bool>::sse_decode(&mut deserializer);
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
                 let output_ok = Result::<_, ()>::Ok(crate::MobileConvexClient::new(
                     api_deployment_url,
                     api_client_id,
+                    api_verbose_logging,
                 ))?;
                 Ok(output_ok)
             })())
