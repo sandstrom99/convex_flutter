@@ -43,11 +43,19 @@ class ConvexConfig {
   /// queries and catching TimeoutException.
   final String? healthCheckQuery;
 
+  /// Whether to emit verbose debug logs (connection chatter, pongs, state
+  /// transitions, raw messages, etc.).
+  ///
+  /// Defaults to `false`. Set to `true` (e.g. via `kDebugMode`) to see
+  /// informational logs. Error-level logs are always printed regardless.
+  final bool debugLogging;
+
   /// Creates a new ConvexConfig with the specified options.
   const ConvexConfig({
     required this.deploymentUrl,
     this.clientId,
     this.operationTimeout = const Duration(seconds: 30),
     this.healthCheckQuery,
+    this.debugLogging = false,
   });
 }

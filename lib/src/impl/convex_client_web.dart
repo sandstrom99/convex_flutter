@@ -1,3 +1,31 @@
+// VENDORED & PATCHED — do not replace from pub.dev without re-applying fixes.
+// Patches applied on top of convex_flutter 3.0.1:
+//   1. _sendAuthMessage: correct Authenticate message format (tokenType/value/baseVersion)
+//   2. setAuth: pass null instead of '' for sign-out so tokenType:"None" is sent
+//   3. _sendMessage: queue messages when WebSocket is still CONNECTING (fixes startup race)
+//   4. _handleMutationResponse / _handleActionResponse: check success flag before
+//      treating null result as an error (void-returning functions return null legitimately)
+//   5. _handleMutationResponse / _handleActionResponse: emit ClientError (convexError
+//      or serverError) instead of generic Exception, matching native FFI error types
+//   6. _sendAuthMessage: use separate _identityVersion counter (not _querySetVersion)
+//      for Authenticate baseVersion — the Convex protocol tracks these independently
+//   7. _handleTransition: deliver null QueryUpdated values to subscribers (e.g. query
+//      returning null for unauthenticated user)
+//   8. onopen: sync _querySetVersion after flushing queued ModifyQuerySet messages
+//   9. All informational debugPrint calls gated behind config.debugLogging
+//  10. onopen: skip queued Authenticate messages during flush (onopen already sends
+//      auth from _currentAuthToken — flushing a duplicate causes a protocol error)
+//  11. onopen: re-register active subscriptions after reconnect so the new server
+//      session knows about them (previously subscriptions were lost on WS drop);
+//      excludes queryIds already sent via queue flush to avoid duplicate Add errors
+//  12. _handleFatalError: generate fresh sessionId and reset state before reconnect
+//      so the server creates a clean session instead of resuming stale state
+//  13. _sendConnectMessage: use _connectionCount (monotonic) instead of
+//      _reconnectAttempts for connectionCount field — the old code always sent 1
+//  14. _WebSubscription: store udfPath + args for re-registration on reconnect
+//  15. Always-on diagnostic logging for WS open/close, setAuth, AuthError,
+//      FatalError, and max-reconnect — not gated behind debugLogging
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:js_interop';
@@ -6,7 +34,8 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:web/web.dart' as web;
 import 'package:convex_flutter/src/impl/convex_client_interface.dart';
-import 'package:convex_flutter/src/rust/lib.dart' show WebSocketConnectionState, SubscriptionHandle, AuthHandle;
+import 'package:convex_flutter/src/rust/lib.dart'
+    show AuthHandle, ClientError, SubscriptionHandle, WebSocketConnectionState;
 import 'package:convex_flutter/src/connection_status.dart';
 import 'package:convex_flutter/src/convex_config.dart';
 import 'package:convex_flutter/src/app_lifecycle_event.dart';
@@ -62,14 +91,25 @@ class WebConvexClient implements IConvexClient {
   /// Query set version counter for ModifyQuerySet messages
   int _querySetVersion = 0;
 
+  /// Identity version counter for Authenticate messages (separate from querySetVersion)
+  int _identityVersion = 0;
+
   /// Pending requests waiting for responses (query, mutation, action)
   final Map<int, Completer<String>> _pendingRequests = {};
 
   /// Active subscriptions
   final Map<String, _WebSubscription> _subscriptions = {};
 
+  /// Messages queued while WebSocket is still connecting.
+  final List<Map<String, dynamic>> _messageQueue = [];
+
   /// Reconnection attempt counter
   int _reconnectAttempts = 0;
+
+  /// Monotonic connection counter (never reset). Used as the Convex protocol
+  /// `connectionCount` field so the server can distinguish first connection (0)
+  /// from reconnections (1, 2, …).
+  int _connectionCount = 0;
 
   /// Maximum reconnection attempts
   static const int _maxReconnectAttempts = 10;
@@ -93,7 +133,8 @@ class WebConvexClient implements IConvexClient {
   /// - Event listener registration
   /// - Lifecycle observer setup
   static Future<WebConvexClient> create(ConvexConfig config) async {
-    debugPrint('=== [WebConvexClient] Creating web client ===');
+    if (config.debugLogging)
+      debugPrint('=== [WebConvexClient] Creating web client ===');
 
     final client = WebConvexClient._(config);
 
@@ -106,14 +147,18 @@ class WebConvexClient implements IConvexClient {
       onLifecycleChange: (event) {
         client._lifecycleController.add(event);
         // Do NOT trigger reconnection on web - let WebSocket manage itself
-        debugPrint('=== [WebConvexClient] Lifecycle event: ${event.name} (no action on web) ===');
+        if (config.debugLogging)
+          debugPrint(
+            '=== [WebConvexClient] Lifecycle event: ${event.name} (no action on web) ===',
+          );
       },
     );
 
     // Establish WebSocket connection
     await client._connect();
 
-    debugPrint('=== [WebConvexClient] Client created successfully ===');
+    if (config.debugLogging)
+      debugPrint('=== [WebConvexClient] Client created successfully ===');
     return client;
   }
 
@@ -121,7 +166,8 @@ class WebConvexClient implements IConvexClient {
   Future<void> _connect() async {
     if (_isDisposed) return;
 
-    debugPrint('=== [WebConvexClient] Connecting to Convex ===');
+    if (config.debugLogging)
+      debugPrint('=== [WebConvexClient] Connecting to Convex ===');
 
     try {
       // Convert HTTPS to WSS URL with correct Convex sync endpoint
@@ -129,7 +175,8 @@ class WebConvexClient implements IConvexClient {
       final wsUrl = config.deploymentUrl.replaceFirst('https', 'wss');
       final fullUrl = '$wsUrl/api/sync';
 
-      debugPrint('=== [WebConvexClient] WebSocket URL: $fullUrl ===');
+      if (config.debugLogging)
+        debugPrint('=== [WebConvexClient] WebSocket URL: $fullUrl ===');
 
       // Update state to connecting
       _updateConnectionState(WebSocketConnectionState.connecting);
@@ -140,7 +187,8 @@ class WebConvexClient implements IConvexClient {
       // Setup event listeners
       _setupWebSocketListeners();
 
-      debugPrint('=== [WebConvexClient] WebSocket connection initiated ===');
+      if (config.debugLogging)
+        debugPrint('=== [WebConvexClient] WebSocket connection initiated ===');
     } catch (e) {
       debugPrint('ERROR: [WebConvexClient] Connection failed: $e');
       _scheduleReconnect();
@@ -154,9 +202,19 @@ class WebConvexClient implements IConvexClient {
 
     // Connection opened
     ws.onopen = (web.Event event) {
-      debugPrint('=== [WebConvexClient] WebSocket opened ===');
+      if (config.debugLogging)
+        debugPrint('=== [WebConvexClient] WebSocket opened ===');
+      debugPrint(
+        '[WebConvexClient] WS connected '
+        '(session=$_sessionId, connCount=$_connectionCount, '
+        'qsVersion=$_querySetVersion→0, idVersion=$_identityVersion→0, '
+        'queueLen=${_messageQueue.length}, '
+        'activeSubs=${_subscriptions.length}, '
+        'hasAuth=${_currentAuthToken != null})',
+      );
       _reconnectAttempts = 0; // Reset reconnection counter
       _querySetVersion = 0; // Reset query set version for new connection
+      _identityVersion = 0; // Reset identity version for new connection
       _updateConnectionState(WebSocketConnectionState.connected);
 
       // Send Connect handshake (required by Convex protocol)
@@ -166,6 +224,56 @@ class WebConvexClient implements IConvexClient {
       if (_currentAuthToken != null) {
         _sendAuthMessage(_currentAuthToken!);
       }
+
+      // Flush messages that were queued while WebSocket was connecting.
+      // Skip queued Authenticate messages — onopen already sent auth above.
+      // Sending a duplicate would cause a protocol version mismatch error.
+      //
+      // Track which queryIds were sent via queue flush so _resubscribeAll()
+      // doesn't duplicate them (duplicate Add → server InternalServerError).
+      final flushedQueryIds = <int>{};
+      if (_messageQueue.isNotEmpty) {
+        if (config.debugLogging)
+          debugPrint(
+            '=== [WebConvexClient] Flushing ${_messageQueue.length} queued message(s) ===',
+          );
+        final queued = List<Map<String, dynamic>>.from(_messageQueue);
+        _messageQueue.clear();
+        for (final msg in queued) {
+          if (msg['type'] == 'Authenticate') {
+            if (config.debugLogging)
+              debugPrint(
+                '=== [WebConvexClient] Skipping queued Authenticate (already sent in onopen) ===',
+              );
+            continue;
+          }
+          // Track version changes from queued ModifyQuerySet messages so
+          // _querySetVersion stays in sync with what the server processes.
+          if (msg['type'] == 'ModifyQuerySet') {
+            _querySetVersion = msg['newVersion'] as int;
+            // Record queryIds so _resubscribeAll can skip them.
+            final mods = msg['modifications'] as List?;
+            if (mods != null) {
+              for (final mod in mods) {
+                if (mod is Map && mod['queryId'] is int) {
+                  flushedQueryIds.add(mod['queryId'] as int);
+                }
+              }
+            }
+          }
+          _sendMessage(msg);
+        }
+      }
+
+      // Re-register active subscriptions that survived a reconnect.
+      // After a WS drop + reconnect, the server has a fresh session with no
+      // subscriptions. The _subscriptions map still holds Dart-side callbacks,
+      // but the server doesn't know about them. Re-send a single
+      // ModifyQuerySet with all active subscriptions so live data flows again.
+      //
+      // Skip queryIds that were already sent during queue flush above —
+      // duplicate Add for the same queryId causes server InternalServerError.
+      _resubscribeAll(excludeQueryIds: flushedQueryIds);
     }.toJS;
 
     // Connection closed
@@ -173,8 +281,12 @@ class WebConvexClient implements IConvexClient {
       final code = event.code;
       final reason = event.reason;
       final wasClean = event.wasClean;
-      debugPrint('=== [WebConvexClient] WebSocket closed ===');
-      debugPrint('=== [WebConvexClient] Close code: $code, reason: "$reason", wasClean: $wasClean ===');
+      debugPrint(
+        '[WebConvexClient] WS closed '
+        '(code=$code, reason="$reason", wasClean=$wasClean, '
+        'session=$_sessionId, qsVersion=$_querySetVersion, '
+        'activeSubs=${_subscriptions.length})',
+      );
       _updateConnectionState(WebSocketConnectionState.connecting);
 
       // Attempt reconnection if not disposed
@@ -207,13 +319,17 @@ class WebConvexClient implements IConvexClient {
   /// Handles incoming WebSocket messages.
   void _handleMessage(String data) {
     try {
-      debugPrint('=== [WebConvexClient] RAW MESSAGE: $data ===');
+      if (config.debugLogging)
+        debugPrint('=== [WebConvexClient] RAW MESSAGE: $data ===');
 
       final message = jsonDecode(data) as Map<String, dynamic>;
       final type = message['type'] as String?;
       final id = message['id'] as String?;
 
-      debugPrint('=== [WebConvexClient] Received message type: $type, id: $id ===');
+      if (config.debugLogging)
+        debugPrint(
+          '=== [WebConvexClient] Received message type: $type, id: $id ===',
+        );
 
       switch (type) {
         case 'Transition':
@@ -262,11 +378,40 @@ class WebConvexClient implements IConvexClient {
       final subscription = _subscriptions[queryId];
       if (subscription == null) continue;
 
-      final value = mod['value'];
-      if (value != null) {
-        final valueJson = jsonEncode(value);
-        subscription.onUpdate(valueJson);
+      // Check for error — Convex sends error information when the query
+      // fails (e.g. ArgumentValidationError, application-level ConvexError).
+      // The field name varies by Convex protocol version; check all known
+      // variants: errorMessage, error_message, errorData, error.
+      final errorMessage =
+          (mod['errorMessage'] ?? mod['error_message']) as String? ??
+          (mod['error'] is String ? mod['error'] as String : null);
+      final errorData =
+          mod['errorData'] as String? ??
+          (mod['error'] is Map ? jsonEncode(mod['error']) : null);
+
+      if (errorMessage != null) {
+        debugPrint(
+          '=== [WebConvexClient] Subscription error for queryId=$queryId: '
+          '$errorMessage (data: $errorData) ===',
+        );
+        subscription.onError(errorMessage, errorData);
+        continue;
       }
+
+      // If there's no value key at all AND no error, log for diagnostics
+      // (this shouldn't happen in normal protocol flow).
+      if (!mod.containsKey('value')) {
+        debugPrint(
+          '=== [WebConvexClient] Transition mod with no value or error for '
+          'queryId=$queryId. Keys: ${(mod as Map).keys.toList()} ===',
+        );
+        continue;
+      }
+
+      // Forward all values including null (e.g. query returning null for
+      // an unauthenticated user). The subscriber decodes via jsonDecode.
+      final valueJson = jsonEncode(mod['value']);
+      subscription.onUpdate(valueJson);
     }
   }
 
@@ -278,12 +423,12 @@ class WebConvexClient implements IConvexClient {
     final completer = _pendingRequests.remove(requestId);
     if (completer == null) return;
 
+    final success = message['success'] as bool? ?? false;
     final result = message['result'];
-    if (result != null) {
-      final resultJson = jsonEncode(result);
-      completer.complete(resultJson);
+    if (!success) {
+      completer.completeError(_buildClientError(result, 'Mutation failed'));
     } else {
-      completer.completeError(Exception('No result in mutation response'));
+      completer.complete(result != null ? jsonEncode(result) : 'null');
     }
   }
 
@@ -295,30 +440,64 @@ class WebConvexClient implements IConvexClient {
     final completer = _pendingRequests.remove(requestId);
     if (completer == null) return;
 
+    final success = message['success'] as bool? ?? false;
     final result = message['result'];
-    if (result != null) {
-      final resultJson = jsonEncode(result);
-      completer.complete(resultJson);
+    if (!success) {
+      completer.completeError(_buildClientError(result, 'Action failed'));
     } else {
-      completer.completeError(Exception('No result in action response'));
+      completer.complete(result != null ? jsonEncode(result) : 'null');
     }
+  }
+
+  /// Builds a [ClientError] from an error response, matching the native FFI
+  /// client's error types.
+  ///
+  /// If `errorData` is present (from a Convex `ConvexError`), emits
+  /// [ClientError.convexError]. Otherwise emits [ClientError.serverError].
+  ClientError _buildClientError(dynamic result, String fallback) {
+    final errorData = result is Map ? result['data'] : null;
+    if (errorData != null) {
+      return ClientError.convexError(data: jsonEncode(errorData));
+    }
+    final message = result is Map
+        ? (result['message']?.toString() ?? fallback)
+        : (result?.toString() ?? fallback);
+    return ClientError.serverError(msg: message);
   }
 
   /// Handles FatalError messages.
   void _handleFatalError(Map<String, dynamic> message) {
     final error = message['error'] as String? ?? 'Unknown fatal error';
-    debugPrint('FATAL ERROR: [WebConvexClient] $error');
+    debugPrint(
+      'FATAL ERROR: [WebConvexClient] $error '
+      '(session=$_sessionId, qsVersion=$_querySetVersion, '
+      'idVersion=$_identityVersion, activeSubs=${_subscriptions.length})',
+    );
 
-    // Close connection on fatal error
+    // Force a brand-new server session on the next reconnect by discarding
+    // the current sessionId. Without this, the reconnect reuses the same
+    // sessionId and the server tries to resume the broken session — which
+    // immediately triggers another FatalError (version mismatch).
+    _sessionId = null;
+    _connectionCount = 0;
+
+    // Close connection — the onclose handler will trigger _scheduleReconnect,
+    // which creates a fresh WS. The new onopen will generate a new sessionId
+    // and re-register all active subscriptions via _resubscribeAll().
     _ws?.close();
   }
 
   /// Handles AuthError messages.
   void _handleAuthError(Map<String, dynamic> message) {
     final error = message['error'] as String? ?? 'Authentication error';
-    debugPrint('AUTH ERROR: [WebConvexClient] $error');
+    final code = message['errorCode'] as String?;
+    debugPrint(
+      'AUTH ERROR: [WebConvexClient] $error '
+      '(code=$code, hasToken=${_currentAuthToken != null}, '
+      'session=$_sessionId)',
+    );
 
-    // Clear auth and notify
+    // Clear auth and notify — triggers token refresh via setAuthWithRefresh
     _authStateController.add(false);
   }
 
@@ -327,10 +506,11 @@ class WebConvexClient implements IConvexClient {
     try {
       _sendMessage({
         'type': 'Event',
-        'eventType': 'Pong',  // Required field
-        'event': null,  // Required field (can be null)
+        'eventType': 'Pong', // Required field
+        'event': null, // Required field (can be null)
       });
-      debugPrint('=== [WebConvexClient] Sent Pong ===');
+      if (config.debugLogging)
+        debugPrint('=== [WebConvexClient] Sent Pong ===');
     } catch (e) {
       debugPrint('ERROR: [WebConvexClient] Failed to send Pong: $e');
     }
@@ -339,18 +519,23 @@ class WebConvexClient implements IConvexClient {
   /// Sends Connect handshake message.
   void _sendConnectMessage() {
     try {
-      // Generate or reuse session ID (must be valid UUID format)
+      // Generate or reuse session ID (must be valid UUID format).
+      // _sessionId is reset to null in _handleFatalError so that a fresh
+      // session is created after protocol-level failures.
       _sessionId ??= _generateUuid();
 
       _sendMessage({
         'type': 'Connect',
         'sessionId': _sessionId,
         'maxObservedTimestamp': null,
-        'connectionCount': _reconnectAttempts + 1,
-        'lastCloseReason': null,  // Required field
-        'clientTs': DateTime.now().millisecondsSinceEpoch,  // Required field
+        'connectionCount': _connectionCount++,
+        'lastCloseReason': null, // Required field
+        'clientTs': DateTime.now().millisecondsSinceEpoch, // Required field
       });
-      debugPrint('=== [WebConvexClient] Sent Connect handshake ===');
+      if (config.debugLogging)
+        debugPrint(
+          '=== [WebConvexClient] Sent Connect handshake (session=$_sessionId, count=${_connectionCount - 1}) ===',
+        );
     } catch (e) {
       debugPrint('ERROR: [WebConvexClient] Failed to send Connect: $e');
     }
@@ -364,11 +549,15 @@ class WebConvexClient implements IConvexClient {
 
     // Generate random values for each segment
     final segment1 = random.nextInt(0x100000000); // 32 bits = 8 hex chars
-    final segment2 = random.nextInt(0x10000);      // 16 bits = 4 hex chars
-    final segment3 = random.nextInt(0x10000);      // 16 bits = 4 hex chars (we'll set version)
-    final segment4 = random.nextInt(0x10000);      // 16 bits = 4 hex chars (we'll set variant)
+    final segment2 = random.nextInt(0x10000); // 16 bits = 4 hex chars
+    final segment3 = random.nextInt(
+      0x10000,
+    ); // 16 bits = 4 hex chars (we'll set version)
+    final segment4 = random.nextInt(
+      0x10000,
+    ); // 16 bits = 4 hex chars (we'll set variant)
     final segment5a = random.nextInt(0x100000000); // 32 bits = 8 hex chars
-    final segment5b = random.nextInt(0x10000);     // 16 bits = 4 hex chars
+    final segment5b = random.nextInt(0x10000); // 16 bits = 4 hex chars
 
     // Set version 4 (bits 12-15 of segment3 = 0100)
     final version4 = (segment3 & 0x0FFF) | 0x4000;
@@ -377,19 +566,23 @@ class WebConvexClient implements IConvexClient {
     final variant = (segment4 & 0x3FFF) | 0x8000;
 
     // Combine segment5 parts into 12 hex digits
-    final segment5 = '${segment5a.toRadixString(16).padLeft(8, '0')}${segment5b.toRadixString(16).padLeft(4, '0')}';
+    final segment5 =
+        '${segment5a.toRadixString(16).padLeft(8, '0')}${segment5b.toRadixString(16).padLeft(4, '0')}';
 
     return '${segment1.toRadixString(16).padLeft(8, '0')}-'
-           '${segment2.toRadixString(16).padLeft(4, '0')}-'
-           '${version4.toRadixString(16).padLeft(4, '0')}-'
-           '${variant.toRadixString(16).padLeft(4, '0')}-'
-           '$segment5';
+        '${segment2.toRadixString(16).padLeft(4, '0')}-'
+        '${version4.toRadixString(16).padLeft(4, '0')}-'
+        '${variant.toRadixString(16).padLeft(4, '0')}-'
+        '$segment5';
   }
 
   /// Updates connection state and emits to stream.
   void _updateConnectionState(WebSocketConnectionState newState) {
     if (_currentConnectionState != newState) {
-      debugPrint('=== [WebConvexClient] State transition: ${_currentConnectionState.name} → ${newState.name} ===');
+      if (config.debugLogging)
+        debugPrint(
+          '=== [WebConvexClient] State transition: ${_currentConnectionState.name} → ${newState.name} ===',
+        );
       _currentConnectionState = newState;
       _connectionStateController.add(newState);
     }
@@ -402,7 +595,11 @@ class WebConvexClient implements IConvexClient {
     _reconnectTimer?.cancel();
 
     if (_reconnectAttempts >= _maxReconnectAttempts) {
-      debugPrint('ERROR: [WebConvexClient] Max reconnection attempts reached');
+      debugPrint(
+        'ERROR: [WebConvexClient] Max reconnection attempts reached '
+        '(activeSubs=${_subscriptions.length}, '
+        'pendingRequests=${_pendingRequests.length})',
+      );
       return;
     }
 
@@ -410,10 +607,16 @@ class WebConvexClient implements IConvexClient {
     final delay = _baseReconnectDelay * (1 << _reconnectAttempts.clamp(0, 5));
     _reconnectAttempts++;
 
-    debugPrint('=== [WebConvexClient] Scheduling reconnect attempt $_reconnectAttempts in ${delay.inSeconds}s ===');
+    if (config.debugLogging)
+      debugPrint(
+        '=== [WebConvexClient] Scheduling reconnect attempt $_reconnectAttempts in ${delay.inSeconds}s ===',
+      );
 
     _reconnectTimer = Timer(delay, () {
-      debugPrint('=== [WebConvexClient] Executing reconnect attempt $_reconnectAttempts ===');
+      if (config.debugLogging)
+        debugPrint(
+          '=== [WebConvexClient] Executing reconnect attempt $_reconnectAttempts ===',
+        );
       _connect();
     });
   }
@@ -424,28 +627,57 @@ class WebConvexClient implements IConvexClient {
   }
 
   /// Sends a message over WebSocket.
+  /// If the WebSocket is still connecting, the message is queued and sent
+  /// automatically once the connection opens.
   void _sendMessage(Map<String, dynamic> message) {
     final ws = _ws;
     if (ws == null || ws.readyState != web.WebSocket.OPEN) {
-      throw StateError('WebSocket not connected');
+      _messageQueue.add(message);
+      if (config.debugLogging)
+        debugPrint(
+          '=== [WebConvexClient] Queued message (WS not ready): ${message['type']} ===',
+        );
+      return;
     }
 
     final messageJson = jsonEncode(message);
-    debugPrint('=== [WebConvexClient] SENDING: $messageJson ===');
+    if (config.debugLogging)
+      debugPrint('=== [WebConvexClient] SENDING: $messageJson ===');
     ws.send(messageJson.toJS);
 
-    debugPrint('=== [WebConvexClient] Sent message: ${message['type']} (id: ${message['id']}) ===');
+    if (config.debugLogging)
+      debugPrint(
+        '=== [WebConvexClient] Sent message: ${message['type']} (id: ${message['id']}) ===',
+      );
   }
 
   /// Sends authentication message.
-  void _sendAuthMessage(String token) {
+  ///
+  /// Uses [_identityVersion] for baseVersion — this is a separate counter
+  /// from [_querySetVersion] (used by ModifyQuerySet). The Convex protocol
+  /// tracks query set and identity versions independently.
+  void _sendAuthMessage(String? token) {
     try {
-      // Send Authenticate message (Convex protocol)
-      _sendMessage({
-        'type': 'Authenticate',
-        'token': token,
-      });
-      debugPrint('=== [WebConvexClient] Auth token sent ===');
+      final baseVersion = _identityVersion;
+      _identityVersion++;
+
+      // Send Authenticate message (Convex protocol >=1.20)
+      if (token != null && token.isNotEmpty) {
+        _sendMessage({
+          'type': 'Authenticate',
+          'tokenType': 'User',
+          'value': token,
+          'baseVersion': baseVersion,
+        });
+      } else {
+        _sendMessage({
+          'type': 'Authenticate',
+          'tokenType': 'None',
+          'baseVersion': baseVersion,
+        });
+      }
+      if (config.debugLogging)
+        debugPrint('=== [WebConvexClient] Auth token sent ===');
     } catch (e) {
       debugPrint('ERROR: [WebConvexClient] Failed to send auth: $e');
     }
@@ -496,8 +728,8 @@ class WebConvexClient implements IConvexClient {
             'type': 'Add',
             'queryId': queryId,
             'udfPath': name,
-            'args': [args],  // Args must be array
-          }
+            'args': [args], // Args must be array
+          },
         ],
       });
 
@@ -528,8 +760,8 @@ class WebConvexClient implements IConvexClient {
       _sendMessage({
         'type': 'Mutation',
         'requestId': requestId,
-        'udfPath': name,  // Use udfPath instead of name
-        'args': [args],   // Args must be array, not object
+        'udfPath': name, // Use udfPath instead of name
+        'args': [args], // Args must be array, not object
       });
 
       return await completer.future.timeout(
@@ -559,8 +791,8 @@ class WebConvexClient implements IConvexClient {
       _sendMessage({
         'type': 'Action',
         'requestId': requestId,
-        'udfPath': name,  // Use udfPath instead of name
-        'args': [args],   // Args must be array, not object
+        'udfPath': name, // Use udfPath instead of name
+        'args': [args], // Args must be array, not object
       });
 
       return await completer.future.timeout(
@@ -587,11 +819,16 @@ class WebConvexClient implements IConvexClient {
     final queryId = _queryIdCounter++;
     final queryIdStr = queryId.toString();
 
-    // Create subscription record
+    // Create subscription record — store udfPath and args for re-registration
+    // after a WebSocket reconnect (the server loses all subscriptions on drop).
+    final serializedArgs = [args];
     final subscription = _WebSubscription(
       id: queryIdStr,
       onUpdate: onUpdate,
       onError: onError,
+      udfPath: name,
+      args: serializedArgs,
+      isSubscription: true,
     );
     _subscriptions[queryIdStr] = subscription;
 
@@ -608,13 +845,16 @@ class WebConvexClient implements IConvexClient {
           {
             'type': 'Add',
             'queryId': queryId,
-            'udfPath': name,  // Use udfPath instead of name
-            'args': [args],   // Args must be array, not object
-          }
+            'udfPath': name, // Use udfPath instead of name
+            'args': serializedArgs, // Args must be array, not object
+          },
         ],
       });
 
-      debugPrint('=== [WebConvexClient] Subscription created: queryId=$queryId ===');
+      if (config.debugLogging)
+        debugPrint(
+          '=== [WebConvexClient] Subscription created: queryId=$queryId ===',
+        );
 
       // Return handle for cancellation
       return _WebSubscriptionHandle(
@@ -633,7 +873,10 @@ class WebConvexClient implements IConvexClient {
     final subscription = _subscriptions.remove(queryIdStr);
     if (subscription == null) return;
 
-    debugPrint('=== [WebConvexClient] Unsubscribing: queryId=$queryIdStr ===');
+    if (config.debugLogging)
+      debugPrint(
+        '=== [WebConvexClient] Unsubscribing: queryId=$queryIdStr ===',
+      );
 
     try {
       final queryId = int.tryParse(queryIdStr);
@@ -648,15 +891,71 @@ class WebConvexClient implements IConvexClient {
         'baseVersion': baseVersion,
         'newVersion': newVersion,
         'modifications': [
-          {
-            'type': 'Remove',
-            'queryId': queryId,
-          }
+          {'type': 'Remove', 'queryId': queryId},
         ],
       });
     } catch (e) {
       debugPrint('ERROR: [WebConvexClient] Failed to send unsubscribe: $e');
     }
+  }
+
+  /// Re-registers all active long-lived subscriptions with the server.
+  ///
+  /// Called from onopen after a reconnect. The server session is fresh (version
+  /// 0, no subscriptions) but the Dart-side _subscriptions map still holds
+  /// callbacks from the previous connection. We send a single ModifyQuerySet
+  /// containing Add entries for every subscription so live data starts flowing
+  /// again without the UI needing to know about the reconnect.
+  void _resubscribeAll({Set<int> excludeQueryIds = const {}}) {
+    // Collect subscriptions that can be re-registered (have stored query info
+    // and are long-lived subscriptions, not one-shot queries).
+    // Skip any queryIds that were already sent during queue flush.
+    final resubs =
+        _subscriptions.values
+            .where(
+              (s) =>
+                  s.isSubscription &&
+                  s.udfPath != null &&
+                  !excludeQueryIds.contains(int.tryParse(s.id)),
+            )
+            .toList();
+
+    if (resubs.isEmpty) return;
+
+    if (config.debugLogging)
+      debugPrint(
+        '=== [WebConvexClient] Re-registering ${resubs.length} subscription(s) after reconnect ===',
+      );
+
+    final modifications = <Map<String, dynamic>>[];
+    for (final sub in resubs) {
+      final queryId = int.tryParse(sub.id);
+      if (queryId == null) continue;
+
+      modifications.add({
+        'type': 'Add',
+        'queryId': queryId,
+        'udfPath': sub.udfPath,
+        'args': sub.args ?? [{}],
+      });
+    }
+
+    if (modifications.isEmpty) return;
+
+    final baseVersion = _querySetVersion;
+    final newVersion = ++_querySetVersion;
+
+    _sendMessage({
+      'type': 'ModifyQuerySet',
+      'baseVersion': baseVersion,
+      'newVersion': newVersion,
+      'modifications': modifications,
+    });
+
+    if (config.debugLogging)
+      debugPrint(
+        '=== [WebConvexClient] Re-registered ${modifications.length} subscription(s) (version $baseVersion → $newVersion) ===',
+      );
   }
 
   // ============================================================================
@@ -665,13 +964,21 @@ class WebConvexClient implements IConvexClient {
 
   @override
   Future<void> setAuth({required String? token}) async {
+    final hadToken = _currentAuthToken != null;
     _currentAuthToken = token;
+
+    debugPrint(
+      '[WebConvexClient] setAuth: '
+      '${hadToken ? "replacing" : "setting"} token → '
+      '${token != null ? "present" : "null"} '
+      '(wsReady=${_ws?.readyState == web.WebSocket.OPEN})',
+    );
 
     if (token != null) {
       _sendAuthMessage(token);
       _authStateController.add(true);
     } else {
-      _sendAuthMessage(''); // Clear auth
+      _sendAuthMessage(null); // Clear auth
       _authStateController.add(false);
     }
   }
@@ -680,20 +987,58 @@ class WebConvexClient implements IConvexClient {
   Future<AuthHandle> setAuthWithRefresh({
     required Future<String?> Function() tokenFetcher,
     void Function(bool isAuthenticated)? onAuthChange,
+    String? initialToken,
   }) async {
-    // TODO: Implement token refresh for web
-    // For now, just fetch token once and set it
-    final token = await tokenFetcher();
+    // Use initialToken if provided, otherwise fetch one.
+    // When the caller already obtained a JWT (e.g. from restoreSession),
+    // passing it as initialToken avoids a redundant tokenFetcher call that
+    // would consume the single-use refresh token.
+    final token = initialToken ?? await tokenFetcher();
     await setAuth(token: token);
 
     if (onAuthChange != null) {
       onAuthChange(token != null);
     }
 
-    // Return a simple auth handle (no auto-refresh yet)
+    // Listen for AuthError messages from the server (e.g. JWT expired)
+    // and automatically refresh the token.
+    StreamSubscription<bool>? authSub;
+    authSub = _authStateController.stream.listen((isAuthenticated) async {
+      if (!isAuthenticated) {
+        // Server reported auth failure — try to refresh
+        debugPrint(
+          '[WebConvexClient] Auth lost — requesting fresh token from bridge '
+          '(wsReady=${_ws?.readyState == web.WebSocket.OPEN}, '
+          'session=$_sessionId)',
+        );
+        try {
+          final newToken = await tokenFetcher();
+          if (newToken != null) {
+            await setAuth(token: newToken);
+            onAuthChange?.call(true);
+            debugPrint(
+              '[WebConvexClient] Token refresh succeeded',
+            );
+          } else {
+            onAuthChange?.call(false);
+            debugPrint(
+              '[WebConvexClient] Token refresh returned null — '
+              'bridge could not obtain a fresh Clerk token',
+            );
+          }
+        } catch (e) {
+          debugPrint(
+            'ERROR: [WebConvexClient] Token refresh failed: $e',
+          );
+          onAuthChange?.call(false);
+        }
+      }
+    });
+
     return _WebAuthHandle(
       isAuth: token != null,
       onDispose: () async {
+        authSub?.cancel();
         await setAuth(token: null);
       },
     );
@@ -719,7 +1064,8 @@ class WebConvexClient implements IConvexClient {
       _connectionStateController.stream;
 
   @override
-  WebSocketConnectionState get currentConnectionState => _currentConnectionState;
+  WebSocketConnectionState get currentConnectionState =>
+      _currentConnectionState;
 
   @override
   bool get isConnected =>
@@ -747,11 +1093,16 @@ class WebConvexClient implements IConvexClient {
 
   @override
   Future<bool> reconnect() async {
-    debugPrint('=== [WebConvexClient] Manual reconnect requested ===');
+    if (config.debugLogging)
+      debugPrint('=== [WebConvexClient] Manual reconnect requested ===');
 
     // Close existing connection if any
     _ws?.close();
     _ws = null;
+
+    // Force a fresh server session on manual reconnect
+    _sessionId = null;
+    _connectionCount = 0;
 
     // Reset reconnection counter for manual reconnect
     _reconnectAttempts = 0;
@@ -785,7 +1136,8 @@ class WebConvexClient implements IConvexClient {
   void dispose() {
     if (_isDisposed) return;
 
-    debugPrint('=== [WebConvexClient] Disposing client ===');
+    if (config.debugLogging)
+      debugPrint('=== [WebConvexClient] Disposing client ===');
     _isDisposed = true;
 
     // Cancel reconnection timer
@@ -807,7 +1159,8 @@ class WebConvexClient implements IConvexClient {
     _pendingRequests.clear();
     _subscriptions.clear();
 
-    debugPrint('=== [WebConvexClient] Client disposed ===');
+    if (config.debugLogging)
+      debugPrint('=== [WebConvexClient] Client disposed ===');
   }
 }
 
@@ -817,10 +1170,24 @@ class _WebSubscription {
   final void Function(String) onUpdate;
   final void Function(String, String?) onError;
 
+  /// UDF path (e.g. "users:getCurrent") — stored for re-registration after reconnect.
+  final String? udfPath;
+
+  /// Serialized args (e.g. [{}]) — stored for re-registration after reconnect.
+  final List<dynamic>? args;
+
+  /// Whether this is a long-lived subscription (not a one-shot query).
+  /// One-shot queries auto-unsubscribe on first result and should NOT be
+  /// re-registered after a reconnect.
+  final bool isSubscription;
+
   _WebSubscription({
     required this.id,
     required this.onUpdate,
     required this.onError,
+    this.udfPath,
+    this.args,
+    this.isSubscription = false,
   });
 }
 
@@ -854,10 +1221,7 @@ class _WebAuthHandle implements AuthHandle {
   final Future<void> Function() onDispose;
   bool _isDisposed = false;
 
-  _WebAuthHandle({
-    required this.isAuth,
-    required this.onDispose,
-  });
+  _WebAuthHandle({required this.isAuth, required this.onDispose});
 
   @override
   bool isAuthenticated() => isAuth && !_isDisposed;

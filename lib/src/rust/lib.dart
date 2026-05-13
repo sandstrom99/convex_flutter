@@ -8,7 +8,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'lib.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `connected_client`, `decode_jwt_expiry`, `handle_direct_function_result`, `internal_action`, `internal_mutation`, `internal_set_auth`, `internal_subscribe`, `new`, `new`, `parse_json_args`
+// These functions are ignored because they are not marked as `pub`: `connected_client`, `decode_jwt_expiry`, `diagnose_connectivity`, `handle_direct_function_result`, `init_logging`, `internal_action`, `internal_mutation`, `internal_set_auth`, `internal_subscribe`, `new`, `new`, `parse_json_args`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `JwtClaims`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`, `fmt`, `fmt`, `from`, `from`
 
@@ -60,9 +60,11 @@ abstract class MobileConvexClient implements RustOpaqueInterface {
   factory MobileConvexClient({
     required String deploymentUrl,
     required String clientId,
+    required bool verboseLogging,
   }) => RustLib.instance.api.crateMobileConvexClientNew(
     deploymentUrl: deploymentUrl,
     clientId: clientId,
+    verboseLogging: verboseLogging,
   );
 
   /// Sets up WebSocket connection state change listener.

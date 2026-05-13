@@ -116,6 +116,7 @@ abstract class RustLibApi extends BaseApi {
   MobileConvexClient crateMobileConvexClientNew({
     required String deploymentUrl,
     required String clientId,
+    required bool verboseLogging,
   });
 
   Future<void> crateMobileConvexClientOnWebsocketStateChange({
@@ -498,6 +499,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   MobileConvexClient crateMobileConvexClientNew({
     required String deploymentUrl,
     required String clientId,
+    required bool verboseLogging,
   }) {
     return handler.executeSync(
       SyncTask(
@@ -505,6 +507,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(deploymentUrl, serializer);
           sse_encode_String(clientId, serializer);
+          sse_encode_bool(verboseLogging, serializer);
           return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 9)!;
         },
         codec: SseCodec(
@@ -513,7 +516,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: null,
         ),
         constMeta: kCrateMobileConvexClientNewConstMeta,
-        argValues: [deploymentUrl, clientId],
+        argValues: [deploymentUrl, clientId, verboseLogging],
         apiImpl: this,
       ),
     );
@@ -521,7 +524,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateMobileConvexClientNewConstMeta => const TaskConstMeta(
     debugName: "MobileConvexClient_new",
-    argNames: ["deploymentUrl", "clientId"],
+    argNames: ["deploymentUrl", "clientId", "verboseLogging"],
   );
 
   @override

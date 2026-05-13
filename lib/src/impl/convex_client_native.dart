@@ -64,6 +64,7 @@ class NativeConvexClient implements IConvexClient {
     final rustClient = MobileConvexClient(
       deploymentUrl: config.deploymentUrl,
       clientId: config.clientId ?? 'flutter-client',
+      verboseLogging: config.debugLogging,
     );
 
     // Create native client wrapper
@@ -87,19 +88,24 @@ class NativeConvexClient implements IConvexClient {
   ///
   /// This must be called before any queries/mutations to capture all state changes.
   Future<void> _setupConnectionStateListener() async {
-    debugPrint('=== [NativeConvexClient] Setting up WebSocket state listener ===');
-    debugPrint('=== [NativeConvexClient] Current state: ${_currentConnectionState.name} ===');
+    if (config.debugLogging) {
+      debugPrint(
+        '=== [NativeConvexClient] Setting up WebSocket state listener ===',
+      );
+    }
 
     try {
       await _rustClient.onWebsocketStateChange(
         onStateChange: (state) async {
-          debugPrint('=== [NativeConvexClient] State changed: ${state.name} ===');
+          if (config.debugLogging) {
+            debugPrint(
+              '=== [NativeConvexClient] State changed: ${state.name} ===',
+            );
+          }
           _currentConnectionState = state;
           _connectionStateController.add(state);
-          debugPrint('=== [NativeConvexClient] Stream emission complete ===');
         },
       );
-      debugPrint('=== [NativeConvexClient] Listener registered successfully ===');
     } catch (e) {
       debugPrint('ERROR: [NativeConvexClient] Listener setup failed: $e');
       rethrow;
@@ -113,9 +119,10 @@ class NativeConvexClient implements IConvexClient {
   @override
   Future<String> query(String name, Map<String, dynamic> args) async {
     final formattedArgs = buildArgs(args);
-    return await _rustClient
+    final result = await _rustClient
         .query(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
+    return normalizeJsonNumbers(result);
   }
 
   @override
@@ -124,9 +131,10 @@ class NativeConvexClient implements IConvexClient {
     required Map<String, dynamic> args,
   }) async {
     final formattedArgs = buildArgs(args);
-    return await _rustClient
+    final result = await _rustClient
         .mutation(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
+    return normalizeJsonNumbers(result);
   }
 
   @override
@@ -135,9 +143,10 @@ class NativeConvexClient implements IConvexClient {
     required Map<String, dynamic> args,
   }) async {
     final formattedArgs = buildArgs(args);
-    return await _rustClient
+    final result = await _rustClient
         .action(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
+    return normalizeJsonNumbers(result);
   }
 
   @override
@@ -151,8 +160,26 @@ class NativeConvexClient implements IConvexClient {
     return await _rustClient.subscribe(
       name: name,
       args: formattedArgs,
-      onUpdate: (value) => onUpdate(value),
-      onError: (message, value) => onError(message, value),
+      onUpdate: (value) {
+        try {
+          onUpdate(normalizeJsonNumbers(value));
+        } catch (e, st) {
+          debugPrint(
+            'ERROR: [NativeConvexClient] onUpdate callback threw for '
+            '"$name": $e\n$st',
+          );
+        }
+      },
+      onError: (message, value) {
+        try {
+          onError(message, value);
+        } catch (e, st) {
+          debugPrint(
+            'ERROR: [NativeConvexClient] onError callback threw for '
+            '"$name": $e\n$st',
+          );
+        }
+      },
     );
   }
 
@@ -174,10 +201,14 @@ class NativeConvexClient implements IConvexClient {
   Future<AuthHandle> setAuthWithRefresh({
     required Future<String?> Function() tokenFetcher,
     void Function(bool isAuthenticated)? onAuthChange,
+    String? initialToken,
   }) async {
     // Dispose any existing auth handle
     _currentAuthHandle?.dispose();
 
+    // Native: Rust SDK handles initial token fetch and refresh lifecycle.
+    // initialToken is not used — the Rust client always calls tokenFetcher
+    // for the initial auth and manages refresh internally.
     final handle = await _rustClient.setAuthWithRefresh(
       fetchToken: () async => await tokenFetcher(),
       onAuthChange: (bool isAuth) async {
@@ -213,7 +244,8 @@ class NativeConvexClient implements IConvexClient {
       _connectionStateController.stream;
 
   @override
-  WebSocketConnectionState get currentConnectionState => _currentConnectionState;
+  WebSocketConnectionState get currentConnectionState =>
+      _currentConnectionState;
 
   @override
   bool get isConnected =>

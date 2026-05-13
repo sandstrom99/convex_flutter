@@ -1,6 +1,7 @@
 import 'dart:async';
 
-import 'package:convex_flutter/src/rust/lib.dart' show WebSocketConnectionState, SubscriptionHandle, AuthHandle;
+import 'package:convex_flutter/src/rust/lib.dart'
+    show WebSocketConnectionState, SubscriptionHandle, AuthHandle;
 import 'package:convex_flutter/src/connection_status.dart';
 import 'package:convex_flutter/src/convex_config.dart';
 import 'package:convex_flutter/src/app_lifecycle_event.dart';
@@ -91,13 +92,19 @@ abstract class IConvexClient {
 
   /// Sets authentication with automatic token refresh.
   ///
-  /// [tokenFetcher] - Function that returns a fresh JWT token when called
-  /// [onAuthChange] - Optional callback for auth state changes
+  /// [tokenFetcher] - Function that returns a fresh JWT token when called.
+  /// [onAuthChange] - Optional callback for auth state changes.
+  /// [initialToken] - When provided, the client uses this token for the
+  ///   initial `auth:signIn` instead of calling [tokenFetcher]. This avoids
+  ///   a redundant token fetch when the caller already holds a valid JWT
+  ///   (e.g. from `restoreSession`). When `null`, [tokenFetcher] is called
+  ///   immediately to obtain the initial token (existing behaviour).
   ///
   /// Returns an [AuthHandle] that manages the auth session and token refresh.
   Future<AuthHandle> setAuthWithRefresh({
     required Future<String?> Function() tokenFetcher,
     void Function(bool isAuthenticated)? onAuthChange,
+    String? initialToken,
   });
 
   /// Clears the authentication token and stops any active token refresh.

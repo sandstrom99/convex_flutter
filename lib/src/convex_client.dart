@@ -2,7 +2,8 @@ import 'dart:async';
 
 import 'package:convex_flutter/src/impl/convex_client_interface.dart';
 import 'package:convex_flutter/src/impl/convex_client_factory.dart';
-import 'package:convex_flutter/src/rust/lib.dart' show WebSocketConnectionState, SubscriptionHandle, AuthHandle;
+import 'package:convex_flutter/src/rust/lib.dart'
+    show WebSocketConnectionState, SubscriptionHandle, AuthHandle;
 import 'package:convex_flutter/src/connection_status.dart';
 import 'package:convex_flutter/src/convex_config.dart';
 import 'package:convex_flutter/src/app_lifecycle_event.dart';
@@ -141,10 +142,7 @@ class ConvexClient {
   }) async {
     if (_instance == null) {
       await initialize(
-        ConvexConfig(
-          deploymentUrl: deploymentUrl,
-          clientId: clientId,
-        ),
+        ConvexConfig(deploymentUrl: deploymentUrl, clientId: clientId),
       );
     }
     return _instance!;
@@ -177,8 +175,7 @@ class ConvexClient {
   Future<String> mutation({
     required String name,
     required Map<String, dynamic> args,
-  }) =>
-      _impl.mutation(name: name, args: args);
+  }) => _impl.mutation(name: name, args: args);
 
   /// Executes a Convex action operation with timeout.
   ///
@@ -190,8 +187,7 @@ class ConvexClient {
   Future<String> action({
     required String name,
     required Map<String, dynamic> args,
-  }) =>
-      _impl.action(name: name, args: args);
+  }) => _impl.action(name: name, args: args);
 
   /// Creates a real-time subscription to a Convex query.
   ///
@@ -206,13 +202,12 @@ class ConvexClient {
     required Map<String, dynamic> args,
     required void Function(String) onUpdate,
     required void Function(String, String?) onError,
-  }) =>
-      _impl.subscribe(
-        name: name,
-        args: args,
-        onUpdate: onUpdate,
-        onError: onError,
-      );
+  }) => _impl.subscribe(
+    name: name,
+    args: args,
+    onUpdate: onUpdate,
+    onError: onError,
+  );
 
   // ============================================================================
   // Authentication API
@@ -260,15 +255,20 @@ class ConvexClient {
   ///
   /// [fetchToken] - Async function that returns a JWT token, or null to sign out.
   /// [onAuthChange] - Optional callback invoked when auth state changes.
+  /// [initialToken] - When provided, the client uses this token for the
+  ///   initial auth instead of calling [fetchToken]. Avoids a redundant
+  ///   token fetch when the caller already holds a valid JWT.
   ///
   /// Returns an [AuthHandleWrapper] that can be used to dispose the auth session.
   Future<AuthHandleWrapper> setAuthWithRefresh({
     required TokenFetcher fetchToken,
     AuthStateCallback? onAuthChange,
+    String? initialToken,
   }) async {
     final handle = await _impl.setAuthWithRefresh(
       tokenFetcher: fetchToken,
       onAuthChange: onAuthChange,
+      initialToken: initialToken,
     );
     return AuthHandleWrapper._(handle);
   }
