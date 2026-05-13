@@ -329,8 +329,6 @@ class WebConvexClient implements IConvexClient {
   /// Handles incoming WebSocket messages.
   void _handleMessage(String data) {
     try {
-      config.logger(ConvexLogLevel.debug, 'web', 'RAW MESSAGE: $data');
-
       final message = jsonDecode(data) as Map<String, dynamic>;
       final type = message['type'] as String?;
       final id = message['id'] as String?;
@@ -338,6 +336,7 @@ class WebConvexClient implements IConvexClient {
       // Skip Ping logging — server heartbeats every ~15s, pure protocol
       // noise. Same treatment in _sendMessage / _sendPong below.
       if (type != 'Ping') {
+        config.logger(ConvexLogLevel.debug, 'web', 'RAW MESSAGE: $data');
         config.logger(
           ConvexLogLevel.debug,
           'web',
