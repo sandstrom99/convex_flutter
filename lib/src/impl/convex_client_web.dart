@@ -335,11 +335,15 @@ class WebConvexClient implements IConvexClient {
       final type = message['type'] as String?;
       final id = message['id'] as String?;
 
-      config.logger(
-        ConvexLogLevel.debug,
-        'web',
-        'Received message type: $type, id: $id',
-      );
+      // Skip Ping logging — server heartbeats every ~15s, pure protocol
+      // noise. Same treatment in _sendMessage / _sendPong below.
+      if (type != 'Ping') {
+        config.logger(
+          ConvexLogLevel.debug,
+          'web',
+          'Received message type: $type, id: $id',
+        );
+      }
 
       switch (type) {
         case 'Transition':
@@ -519,7 +523,8 @@ class WebConvexClient implements IConvexClient {
     if (!_authRefreshRequested.isClosed) _authRefreshRequested.add(null);
   }
 
-  /// Sends Pong response to server Ping.
+  /// Sends Pong response to server Ping. Heartbeat housekeeping — no
+  /// logging on the happy path; failures still surface as errors.
   void _sendPong() {
     try {
       _sendMessage({
@@ -527,7 +532,6 @@ class WebConvexClient implements IConvexClient {
         'eventType': 'Pong', // Required field
         'event': null, // Required field (can be null)
       });
-      config.logger(ConvexLogLevel.debug, 'web', 'Sent Pong');
     } catch (e) {
       config.logger(ConvexLogLevel.error, 'web', 'Failed to send Pong: $e');
     }
@@ -663,14 +667,20 @@ class WebConvexClient implements IConvexClient {
     }
 
     final messageJson = jsonEncode(message);
-    config.logger(ConvexLogLevel.debug, 'web', 'SENDING: $messageJson');
+    // Skip Pong logging (paired with the Ping suppression in onmessage).
+    final isPong = message['type'] == 'Event' && message['eventType'] == 'Pong';
+    if (!isPong) {
+      config.logger(ConvexLogLevel.debug, 'web', 'SENDING: $messageJson');
+    }
     ws.send(messageJson.toJS);
 
-    config.logger(
-      ConvexLogLevel.debug,
-      'web',
-      'Sent message: ${message['type']} (id: ${message['id']})',
-    );
+    if (!isPong) {
+      config.logger(
+        ConvexLogLevel.debug,
+        'web',
+        'Sent message: ${message['type']} (id: ${message['id']})',
+      );
+    }
   }
 
   /// Sends authentication message.
