@@ -90,21 +90,27 @@ abstract class IConvexClient {
   /// Used to authenticate requests to the Convex backend.
   Future<void> setAuth({required String? token});
 
-  /// Sets authentication with automatic token refresh.
+  /// Sets authentication with automatic, JWT-aware token refresh.
   ///
-  /// [tokenFetcher] - Function that returns a fresh JWT token when called.
-  /// [onAuthChange] - Optional callback for auth state changes.
-  /// [initialToken] - When provided, the client uses this token for the
-  ///   initial `auth:signIn` instead of calling [tokenFetcher]. This avoids
-  ///   a redundant token fetch when the caller already holds a valid JWT
-  ///   (e.g. from `restoreSession`). When `null`, [tokenFetcher] is called
-  ///   immediately to obtain the initial token (existing behaviour).
+  /// [tokenFetcher] is called whenever a token is needed:
+  ///   - immediately, to obtain the initial token,
+  ///   - again, ~60 seconds before the current JWT's `exp` claim,
+  ///   - and again on `AuthError` from the server.
   ///
-  /// Returns an [AuthHandle] that manages the auth session and token refresh.
+  /// The caller's [tokenFetcher] is expected to be idempotent / cache-friendly
+  /// (e.g. Clerk's `sessionToken()` returns a cached JWT until it expires) —
+  /// the client may call it more than once in quick succession with no
+  /// special "initial vs refresh" distinction. If you need to observe each
+  /// individual token rotation, do it inside [tokenFetcher].
+  ///
+  /// [onAuthChange] fires on auth state **transitions** only (unauthenticated
+  /// → authenticated, and vice versa) — not on every refresh.
+  ///
+  /// Returns an [AuthHandle] that owns the refresh timer; call `dispose()`
+  /// to stop refreshes and clear auth.
   Future<AuthHandle> setAuthWithRefresh({
     required Future<String?> Function() tokenFetcher,
     void Function(bool isAuthenticated)? onAuthChange,
-    String? initialToken,
   });
 
   /// Clears the authentication token and stops any active token refresh.

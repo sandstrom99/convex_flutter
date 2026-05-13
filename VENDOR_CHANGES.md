@@ -1,10 +1,14 @@
 # Invyte patches on top of upstream convex_flutter
 
 This fork sits on top of [jkuldev/convex_flutter](https://github.com/jkuldev/convex_flutter)
-`main` (post-PR #17 — `convex` 0.10.3 + `Map<String, dynamic>` args). Each section
-below corresponds to a discrete commit on this branch; refer to `git log` for
-exact contents. Upstream issue tracking Android WSS failure:
-[#18](https://github.com/jkuldev/convex_flutter/issues/18).
+`main` (post-PR #17 — `convex` 0.10.3 + `Map<String, dynamic>` args). Each
+section below covers a discrete area of divergence from upstream; refer to
+`git log` for exact commit boundaries. Upstream issue tracking the Android
+WSS failure: [#18](https://github.com/jkuldev/convex_flutter/issues/18).
+
+The fork is intentionally shaped to Invyte's needs (single-app downstream,
+arm64-only mobile target, integration with a `package:logging` consumer).
+Upstreaming is not a goal.
 
 ## Cargokit (`cargokit/`)
 
@@ -23,21 +27,23 @@ restore the upstream lines or pass `--target-platform=android-x64`.
 
 ### TLS: disable default `native-tls-vendored` feature
 
-**Cargo.toml** — `convex` dependency changed to `default-features = false`.
+**Cargo.toml** — `convex` dependency changed to `default-features = false`,
+explicit `rustls = "0.23"` with the `"ring"` provider added.
 
-The `convex` crate's default features enable `native-tls-vendored`, which compiles
-OpenSSL from source. When combined with our explicit `rustls-tls-webpki-roots`
-feature, both TLS backends are linked into `tokio-tungstenite`. At runtime,
-`tokio-tungstenite` prefers `native-tls` when both are present — and vendored
-OpenSSL cannot resolve CA certificates on Android, causing WSS handshakes to fail
-silently (the connection stays in "connecting" forever).
+The `convex` crate's default features enable `native-tls-vendored`, which
+compiles OpenSSL from source. When combined with our explicit
+`rustls-tls-webpki-roots` feature, both TLS backends are linked into
+`tokio-tungstenite`. At runtime, `tokio-tungstenite` prefers `native-tls`
+when both are present — and vendored OpenSSL cannot resolve CA certificates
+on Android, causing WSS handshakes to fail silently (the connection stays
+in "connecting" forever).
 
-Setting `default-features = false` ensures only `rustls` (pure Rust, bundled
-Mozilla CA certs) is compiled. No OpenSSL dependency.
+Setting `default-features = false` plus the explicit rustls pin ensures
+only rustls (pure Rust, bundled Mozilla CA certs) is compiled. No OpenSSL.
 
 ### Logging: tracing → logcat bridge
 
-**Cargo.toml** — added `tracing` with `log` feature.
+**Cargo.toml** — added `tracing = "0.1"` with `log` feature.
 
 **lib.rs** — replaced `println!` (goes to `/dev/null` on Android) with
 `log::debug!` / `log::error!` calls. The `tracing` crate's `log` feature
@@ -46,31 +52,15 @@ and reconnect diagnostics) to automatically fall through to the `log` crate
 when no tracing subscriber is installed. `android_logger` then forwards
 everything to logcat.
 
-Log level is controlled by the `verbose_logging` flag passed from Dart's
-`ConvexConfig.debugLogging`: verbose = Debug (all messages), normal = Warn
-(only warnings and errors).
-
-### Verbose logging flag
+### Verbose native-logging flag
 
 **lib.rs** — `MobileConvexClient::new()` accepts a `verbose_logging: bool`
-parameter that controls `android_logger` max level.
+parameter that controls `android_logger`'s max level. Off → `Warn` (default
+quiet). On → `Debug` (full Convex SDK chatter).
 
-**lib/src/convex_config.dart** — added a `debugLogging` field on
-`ConvexConfig` (defaults to `false`) so consumers can drive verbose mode
-from `kDebugMode`. The Dart wrapper (`NativeConvexClient`) passes it
-through to the Rust constructor and gates all informational `debugPrint`
-calls behind it. Error-level logs are always printed.
-
-### Cross-transport number normalisation
-
-**lib/src/utils.dart** — added `normalizeJsonNumbers()` helper.
-
-Dart's `jsonDecode` preserves `1` (int) vs `1.0` (double). The web client
-delivers integers for whole numbers, but the Rust FFI client serialises
-all Convex `Float64` values with a decimal point. This mismatch causes
-`as int` casts in consumer DTOs to throw on mobile. The native client now
-post-processes results through `normalizeJsonNumbers` so consumers see
-the same Dart types regardless of transport.
+**lib/src/convex_config.dart** — exposed as `verboseNativeLogs` on
+`ConvexConfig`. Separate from the Dart-side [`ConvexLogger`](lib/src/convex_logger.dart)
+callback (different layers, different audiences).
 
 ### Bump Convex SDK
 
@@ -85,87 +75,102 @@ the same Dart types regardless of transport.
   unsubscribe. Long-lived sessions with many distinct subscriptions (Invyte's
   exact shape: events, chat, live) accumulated ~8 KB per query result. Also
   raises Rust MSRV to 1.85; pulls in `imbl` 7.0 (major bump) and new
-  transitives `safe_arch` + `wide`. Mirrors upstream PR #20.
+  transitives `safe_arch` + `wide`.
 
-## Web client (`lib/src/impl/convex_client_web.dart`)
+## Dart layer (`lib/src/`)
 
-All patches listed in the file header comment (patches 1–9):
+### Structured logging via `ConvexLogger`
 
-### 1. Auth message format
+**lib/src/convex_logger.dart** (new file) — typedef + enum:
 
-`_sendAuthMessage` — corrected `Authenticate` message to use the
-`tokenType`/`value`/`baseVersion` structure expected by the Convex protocol.
+```dart
+typedef ConvexLogger = void Function(ConvexLogLevel level, String source, String message);
+enum ConvexLogLevel { debug, info, warn, error }
+```
 
-### 2. Sign-out sends null token
+Every Dart-side log call routes through `config.logger(level, source, message)`.
+Two ready-made implementations are exported:
 
-`setAuth` — pass `null` instead of `''` for sign-out so `tokenType:"None"` is
-sent to the server.
+- `defaultConvexLogger` — emits `warn`+`error` via `debugPrint`, drops debug/info.
+- `silentConvexLogger` — drops everything.
 
-### 3. Message queueing during connect
+Replaces the old mixed-mode logging (some `debugPrint`s gated behind
+`config.debugLogging`, others always-on as "diagnostic logs"). The consumer
+now decides what to surface by passing a custom callback.
 
-`_sendMessage` — queue messages when the WebSocket is still in `CONNECTING`
-state. Queued messages are flushed automatically once the connection opens.
-Fixes a startup race where operations issued before the handshake completed
-were silently lost.
+### Cross-transport number normalisation
 
-### 4. Void-returning function results
+**lib/src/utils.dart** — added `normalizeJsonNumbers()` helper.
 
-`_handleMutationResponse` / `_handleActionResponse` — check the `success` flag
-before treating a `null` result as an error. Void-returning Convex functions
-legitimately return `null`.
+Dart's `jsonDecode` preserves `1` (int) vs `1.0` (double). The web client
+delivers integers for whole numbers, but the Rust FFI client serialises
+all Convex `Float64` values with a decimal point. Without normalisation,
+`as int` casts in consumer DTOs throw on mobile but succeed on web.
 
-### 5. Structured error types
+Gated by `ConvexConfig.convertWholeNumberDoublesToInts` (default `true`).
+Disable when you need to preserve the int/double distinction semantically.
+No effect on the web transport.
 
-`_handleMutationResponse` / `_handleActionResponse` — emit `ClientError`
-(`convexError` or `serverError` variants) instead of generic `Exception`,
-matching the error types produced by the native FFI client.
+### JWT-aware auth refresh, both transports symmetric
 
-### 6. Separate identity version counter
+`setAuthWithRefresh` signature is now identical on both transports:
 
-`_sendAuthMessage` — use a dedicated `_identityVersion` counter (not
-`_querySetVersion`) for the `Authenticate` message's `baseVersion`. The Convex
-protocol tracks query-set and identity versions independently.
+```dart
+Future<AuthHandle> setAuthWithRefresh({
+  required Future<String?> Function() tokenFetcher,
+  void Function(bool isAuthenticated)? onAuthChange,
+});
+```
 
-### 7. Deliver null subscription values
+- `tokenFetcher` is called immediately for the initial token, then on a
+  schedule driven by the JWT's `exp` claim (~60s before expiry), and again
+  on server-side `AuthError`. The caller is expected to handle their own
+  token caching (e.g. Clerk's `sessionToken()` returns a cached JWT) and
+  to observe individual rotations inside `tokenFetcher` itself.
+- `onAuthChange` fires **only on transitions** (unauthenticated ↔ authenticated)
+  — same contract as the Rust SDK. It does not fire on every scheduled
+  refresh while already authenticated.
 
-`_handleTransition` — forward `null` `QueryUpdated` values to subscribers
-(e.g. a query returning `null` for an unauthenticated user). Previously only
-non-null values were delivered.
+The old `initialToken` parameter is removed — it papered over the web
+client's lack of JWT awareness. The web client now decodes JWT expiry and
+schedules refresh like the Rust SDK does on native (decoder lives in
+`_decodeJwtTtl`), and tracks `wasAuthenticated` to deduplicate
+`onAuthChange` firings.
 
-### 8. Query-set version sync on reconnect
+### Web client (`lib/src/impl/convex_client_web.dart`) — protocol fixes
 
-`onopen` handler — sync `_querySetVersion` after flushing queued
-`ModifyQuerySet` messages so the local counter stays consistent with what the
-server has processed.
+Patches against upstream's pure-Dart web implementation. Most are
+straightforward protocol-correctness fixes:
 
-### 9. Debug logging gating
+**Protocol shape**:
+- `_sendAuthMessage`: correct `Authenticate` format (`tokenType`/`value`/
+  `baseVersion`). Sign-out sends `null` token → `tokenType:"None"`.
+- `_sendAuthMessage`: separate `_identityVersion` counter, distinct from
+  `_querySetVersion`. The Convex protocol tracks these independently.
+- `_handle{Mutation,Action}Response`: check `success` flag before treating
+  `null` result as an error (void-returning functions return `null`
+  legitimately); emit `ClientError` (`convexError` / `serverError`)
+  instead of generic `Exception`, matching native FFI error types.
+- `_handleTransition`: deliver `null` `QueryUpdated` values to subscribers
+  (e.g. a query returning `null` for an unauthenticated user); parse and
+  forward subscription error fields (`errorMessage` / `error_message` /
+  `errorData` / `error`) to `subscription.onError()`.
 
-All informational `debugPrint` calls gated behind `config.debugLogging`.
-Error-level logs are always printed.
+**Connection lifecycle**:
+- `_sendMessage`: queue while WebSocket is `CONNECTING`; flush in `onopen`.
+- `onopen`: sync `_querySetVersion` after flushing queued `ModifyQuerySet`;
+  skip queued `Authenticate` messages (already sent in `onopen`);
+  re-register active subscriptions after reconnect so the new server
+  session knows about them (excluding queryIds already sent via the queue
+  flush to avoid duplicate-Add `InternalServerError`).
+- `_WebSubscription` stores `udfPath + args` for re-registration.
+- `_handleFatalError`: generate a fresh `sessionId` and reset state before
+  reconnect so the server creates a clean session instead of resuming the
+  broken one (which would immediately re-trigger the FatalError).
+- `_sendConnectMessage`: monotonic `_connectionCount` (not
+  `_reconnectAttempts`, which always sent 1).
 
-### 10. Subscription error handling
-
-Added error-field parsing for subscription transition messages. The Convex
-protocol may send `errorMessage`, `error_message`, `errorData`, or `error` keys
-when a subscribed query fails. Previously these were silently ignored (the
-update callback was never called). Now errors are forwarded to
-`subscription.onError()`.
-
-Also added a diagnostic log when a transition message contains neither `value`
-nor an error field.
-
-### 11. `setAuthWithRefresh` — initialToken parameter and auto-refresh
-
-Added `initialToken` optional parameter to `setAuthWithRefresh` across the
-interface, native client, and web client. When provided, the web client uses the
-token directly for the initial `Authenticate` message instead of calling
-`tokenFetcher()`, which would consume the single-use refresh token and cause
-"Invalid refresh token" errors.
-
-Also wired up automatic token refresh on the web client: when the server sends
-an `AuthError` (emitted as `false` on `_authStateController`), the web client
-calls `tokenFetcher()` to obtain a new JWT and re-authenticates. The
-subscription is cancelled when the auth handle is disposed.
-
-The native client accepts the parameter for interface compliance but ignores it
-— the Rust SDK manages the initial fetch and refresh lifecycle internally.
+**Auth + refresh** (covered above): JWT-aware refresh loop, private
+`_authRefreshRequested` stream for server-initiated AuthErrors (decoupled
+from the public `_authStateController` so programmatic state changes
+don't trigger spurious refreshes).

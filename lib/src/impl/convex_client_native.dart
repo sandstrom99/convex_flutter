@@ -1,12 +1,12 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:convex_flutter/src/impl/convex_client_interface.dart';
 import 'package:convex_flutter/src/rust/lib.dart';
 import 'package:convex_flutter/src/rust/frb_generated.dart';
 import 'package:convex_flutter/src/utils.dart';
 import 'package:convex_flutter/src/connection_status.dart';
 import 'package:convex_flutter/src/convex_config.dart';
+import 'package:convex_flutter/src/convex_logger.dart';
 import 'package:convex_flutter/src/app_lifecycle_event.dart';
 import 'package:convex_flutter/src/app_lifecycle_observer.dart';
 
@@ -64,7 +64,7 @@ class NativeConvexClient implements IConvexClient {
     final rustClient = MobileConvexClient(
       deploymentUrl: config.deploymentUrl,
       clientId: config.clientId ?? 'flutter-client',
-      verboseLogging: config.debugLogging,
+      verboseLogging: config.verboseNativeLogs,
     );
 
     // Create native client wrapper
@@ -88,26 +88,30 @@ class NativeConvexClient implements IConvexClient {
   ///
   /// This must be called before any queries/mutations to capture all state changes.
   Future<void> _setupConnectionStateListener() async {
-    if (config.debugLogging) {
-      debugPrint(
-        '=== [NativeConvexClient] Setting up WebSocket state listener ===',
-      );
-    }
+    config.logger(
+      ConvexLogLevel.debug,
+      'native',
+      'Setting up WebSocket state listener',
+    );
 
     try {
       await _rustClient.onWebsocketStateChange(
         onStateChange: (state) async {
-          if (config.debugLogging) {
-            debugPrint(
-              '=== [NativeConvexClient] State changed: ${state.name} ===',
-            );
-          }
+          config.logger(
+            ConvexLogLevel.debug,
+            'native',
+            'WS state changed: ${state.name}',
+          );
           _currentConnectionState = state;
           _connectionStateController.add(state);
         },
       );
     } catch (e) {
-      debugPrint('ERROR: [NativeConvexClient] Listener setup failed: $e');
+      config.logger(
+        ConvexLogLevel.error,
+        'native',
+        'WS state listener setup failed: $e',
+      );
       rethrow;
     }
   }
@@ -116,13 +120,19 @@ class NativeConvexClient implements IConvexClient {
   // IConvexClient Implementation - Core Operations
   // ============================================================================
 
+  /// Optionally normalises whole-number doubles to ints in result JSON.
+  /// No-op when `config.convertWholeNumberDoublesToInts` is false.
+  String _normalize(String json) => config.convertWholeNumberDoublesToInts
+      ? normalizeJsonNumbers(json)
+      : json;
+
   @override
   Future<String> query(String name, Map<String, dynamic> args) async {
     final formattedArgs = buildArgs(args);
     final result = await _rustClient
         .query(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
-    return normalizeJsonNumbers(result);
+    return _normalize(result);
   }
 
   @override
@@ -134,7 +144,7 @@ class NativeConvexClient implements IConvexClient {
     final result = await _rustClient
         .mutation(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
-    return normalizeJsonNumbers(result);
+    return _normalize(result);
   }
 
   @override
@@ -146,7 +156,7 @@ class NativeConvexClient implements IConvexClient {
     final result = await _rustClient
         .action(name: name, args: formattedArgs)
         .timeout(config.operationTimeout);
-    return normalizeJsonNumbers(result);
+    return _normalize(result);
   }
 
   @override
@@ -162,11 +172,12 @@ class NativeConvexClient implements IConvexClient {
       args: formattedArgs,
       onUpdate: (value) {
         try {
-          onUpdate(normalizeJsonNumbers(value));
+          onUpdate(_normalize(value));
         } catch (e, st) {
-          debugPrint(
-            'ERROR: [NativeConvexClient] onUpdate callback threw for '
-            '"$name": $e\n$st',
+          config.logger(
+            ConvexLogLevel.error,
+            'native',
+            'onUpdate callback threw for "$name": $e\n$st',
           );
         }
       },
@@ -174,9 +185,10 @@ class NativeConvexClient implements IConvexClient {
         try {
           onError(message, value);
         } catch (e, st) {
-          debugPrint(
-            'ERROR: [NativeConvexClient] onError callback threw for '
-            '"$name": $e\n$st',
+          config.logger(
+            ConvexLogLevel.error,
+            'native',
+            'onError callback threw for "$name": $e\n$st',
           );
         }
       },
@@ -201,14 +213,12 @@ class NativeConvexClient implements IConvexClient {
   Future<AuthHandle> setAuthWithRefresh({
     required Future<String?> Function() tokenFetcher,
     void Function(bool isAuthenticated)? onAuthChange,
-    String? initialToken,
   }) async {
     // Dispose any existing auth handle
     _currentAuthHandle?.dispose();
 
-    // Native: Rust SDK handles initial token fetch and refresh lifecycle.
-    // initialToken is not used — the Rust client always calls tokenFetcher
-    // for the initial auth and manages refresh internally.
+    // The Rust SDK manages the JWT-aware refresh loop and only fires
+    // on_auth_change on transitions — which matches our public contract.
     final handle = await _rustClient.setAuthWithRefresh(
       fetchToken: () async => await tokenFetcher(),
       onAuthChange: (bool isAuth) async {

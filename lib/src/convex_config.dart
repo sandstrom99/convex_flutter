@@ -1,3 +1,5 @@
+import 'convex_logger.dart';
+
 /// Configuration for ConvexClient initialization.
 ///
 /// This class holds all configuration options for initializing
@@ -43,12 +45,46 @@ class ConvexConfig {
   /// queries and catching TimeoutException.
   final String? healthCheckQuery;
 
-  /// Whether to emit verbose debug logs (connection chatter, pongs, state
-  /// transitions, raw messages, etc.).
+  /// Callback invoked for every diagnostic log emitted by the Dart side
+  /// of the client (native and web).
   ///
-  /// Defaults to `false`. Set to `true` (e.g. via `kDebugMode`) to see
-  /// informational logs. Error-level logs are always printed regardless.
-  final bool debugLogging;
+  /// Receives `(level, source, message)`. Implementations should filter
+  /// by level and route to whatever logging framework the host app uses
+  /// (e.g. `package:logging`, Sentry, stdout).
+  ///
+  /// Defaults to [defaultConvexLogger], which emits `warn` and `error`
+  /// via `debugPrint`. Use [silentConvexLogger] to drop everything, or
+  /// pass a custom callback to integrate with your logger.
+  ///
+  /// Does **not** receive Rust-side logs (those go to logcat on Android
+  /// via `android_logger`; control their volume with [verboseNativeLogs]).
+  final ConvexLogger logger;
+
+  /// Whether the native Rust client emits debug-level logs to logcat
+  /// (Android). When `false` (default), only warnings and errors are
+  /// surfaced. When `true`, all Convex SDK tracing events (reconnect,
+  /// backoff, protocol chatter) are emitted at debug level.
+  ///
+  /// Independent of [logger]: Rust-side logs go through `android_logger`,
+  /// not through the [ConvexLogger] callback.
+  ///
+  /// No effect on the web transport (no Rust runtime there).
+  final bool verboseNativeLogs;
+
+  /// Whether to coerce whole-number doubles (e.g. `42.0`) to ints (`42`)
+  /// in query/mutation/action/subscribe results on the native FFI path.
+  ///
+  /// The native (Rust) transport serialises all Convex `Float64` values
+  /// with a decimal point, while the web transport emits ints for whole
+  /// numbers. Without normalisation, `as int` casts in consumer DTOs
+  /// throw on mobile but succeed on web.
+  ///
+  /// Defaults to `true` (cross-transport symmetry). Set to `false` if you
+  /// need to preserve the distinction between `42` and `42.0` — useful
+  /// when the JSON payload encodes that distinction semantically.
+  ///
+  /// No effect on the web transport.
+  final bool convertWholeNumberDoublesToInts;
 
   /// Creates a new ConvexConfig with the specified options.
   const ConvexConfig({
@@ -56,6 +92,8 @@ class ConvexConfig {
     this.clientId,
     this.operationTimeout = const Duration(seconds: 30),
     this.healthCheckQuery,
-    this.debugLogging = false,
+    this.logger = defaultConvexLogger,
+    this.verboseNativeLogs = false,
+    this.convertWholeNumberDoublesToInts = true,
   });
 }

@@ -12,7 +12,11 @@ import 'package:convex_flutter/src/app_lifecycle_event.dart';
 /// Should return a JWT token string, or null to sign out.
 typedef TokenFetcher = Future<String?> Function();
 
-/// Callback type for authentication state changes.
+/// Callback type for authentication state transitions.
+///
+/// Fires when auth goes from unauthenticated to authenticated, or vice
+/// versa. Does NOT fire on every token refresh — observe rotations
+/// inside your own `tokenFetcher`.
 typedef AuthStateCallback = void Function(bool isAuthenticated);
 
 /// A client for interacting with a Convex backend service.
@@ -253,22 +257,23 @@ class ConvexClient {
   /// authHandle.dispose();
   /// ```
   ///
-  /// [fetchToken] - Async function that returns a JWT token, or null to sign out.
-  /// [onAuthChange] - Optional callback invoked when auth state changes.
-  /// [initialToken] - When provided, the client uses this token for the
-  ///   initial auth instead of calling [fetchToken]. Avoids a redundant
-  ///   token fetch when the caller already holds a valid JWT.
+  /// [fetchToken] - Async function that returns a JWT token, or null to sign
+  ///   out. Called immediately for the initial token, then on a schedule
+  ///   driven by the JWT's `exp` claim (~60s before expiry), and again on
+  ///   server-side auth errors. Should be cheap to call repeatedly; the
+  ///   client expects the caller's token store to handle caching.
+  /// [onAuthChange] - Optional callback invoked on auth state **transitions**
+  ///   only (unauthenticated ↔ authenticated). Use [fetchToken] to observe
+  ///   individual rotations.
   ///
   /// Returns an [AuthHandleWrapper] that can be used to dispose the auth session.
   Future<AuthHandleWrapper> setAuthWithRefresh({
     required TokenFetcher fetchToken,
     AuthStateCallback? onAuthChange,
-    String? initialToken,
   }) async {
     final handle = await _impl.setAuthWithRefresh(
       tokenFetcher: fetchToken,
       onAuthChange: onAuthChange,
-      initialToken: initialToken,
     );
     return AuthHandleWrapper._(handle);
   }
