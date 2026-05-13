@@ -31,6 +31,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
 import 'dart:math' as math;
 
 import 'package:web/web.dart' as web;
@@ -42,6 +43,36 @@ import 'package:convex_flutter/src/convex_config.dart';
 import 'package:convex_flutter/src/convex_logger.dart';
 import 'package:convex_flutter/src/app_lifecycle_event.dart';
 import 'package:convex_flutter/src/app_lifecycle_observer.dart';
+
+// Hot-restart safety stash.
+//
+// Flutter web hot-restart re-evaluates Dart but does not reset the JS engine.
+// The `.toJS` WebSocket event handlers we register in [_setupWebSocketListeners]
+// live in JS and hold strong references back into the Dart heap. After hot
+// restart they keep firing into now-orphaned Dart objects: parser closures
+// whose class tables got swapped (NoSuchMethodError on `json[$_get]`), and
+// StreamController listeners that try to setState on widgets attached to a
+// disposed EngineFlutterView.
+//
+// We stash a dispose callback on `globalThis` — which DOES survive hot
+// restart — so each new [WebConvexClient.create] can tear down its
+// predecessor before opening a fresh WebSocket.
+//
+// IMPORTANT: we cannot use `@JS('globalThis.foo') external` field bindings
+// here. DDC's hot-restart sequence clears those module-scoped externals back
+// to null (presumably to drop references to dead Dart isolates' closures).
+// Going through `globalContext.getProperty/setProperty` at the JS-property
+// level bypasses that reset — DDC has no reason to touch a property it
+// doesn't know Dart wrote.
+const String _stashKey = '__convexFlutterActiveDispose';
+
+JSFunction? _readStashedDispose() {
+  return globalContext.getProperty<JSFunction?>(_stashKey.toJS);
+}
+
+void _writeStashedDispose(JSFunction? value) {
+  globalContext.setProperty(_stashKey.toJS, value);
+}
 
 /// Web (pure Dart) implementation of Convex client.
 ///
@@ -144,7 +175,44 @@ class WebConvexClient implements IConvexClient {
   static Future<WebConvexClient> create(ConvexConfig config) async {
     config.logger(ConvexLogLevel.debug, 'web', 'Creating web client');
 
+    // Hot-restart safety: if a prior Dart run left a live WebConvexClient
+    // wired up in JS, tear it down before we open a new WebSocket. Without
+    // this, the orphaned client keeps receiving Transition frames and
+    // pushing them into a dead Dart heap (parse errors, "render a disposed
+    // EngineFlutterView" assertions). See the stash declaration above.
+    final priorDispose = _readStashedDispose();
+    if (priorDispose != null) {
+      try {
+        priorDispose.callAsFunction();
+        config.logger(
+          ConvexLogLevel.info,
+          'web',
+          'Disposed prior WebConvexClient from previous hot-restart cycle',
+        );
+      } catch (e) {
+        config.logger(
+          ConvexLogLevel.warn,
+          'web',
+          'Failed to dispose prior WebConvexClient: $e',
+        );
+      }
+      _writeStashedDispose(null);
+    }
+
     final client = WebConvexClient._(config);
+
+    // Stash a dispose callback in JS so the NEXT Dart run (after the next
+    // hot restart) can find and tear us down. The closure captures `client`
+    // strongly — that's intentional; the JS-side reference keeps the client
+    // reachable until the next create() invokes & clears the stash, which
+    // is exactly when we want the old client gone.
+    _writeStashedDispose((() {
+      try {
+        client.dispose();
+      } catch (_) {
+        // Swallow — caller's logger may itself be defunct after hot restart.
+      }
+    }).toJS);
 
     // Setup lifecycle observer
     // Note: On web, we don't reconnect on lifecycle events because:
@@ -599,6 +667,12 @@ class WebConvexClient implements IConvexClient {
 
   /// Updates connection state and emits to stream.
   void _updateConnectionState(WebSocketConnectionState newState) {
+    // Bail if dispose has run — the WebSocket's async close/error/open
+    // events can still fire after we close the underlying stream
+    // controller, and `.add()` on a closed broadcast controller throws.
+    // Without this guard we get "Bad state: Cannot add new events after
+    // calling close" out of every disposed client's onclose handler.
+    if (_isDisposed || _connectionStateController.isClosed) return;
     if (_currentConnectionState != newState) {
       config.logger(
         ConvexLogLevel.debug,
