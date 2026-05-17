@@ -206,13 +206,15 @@ class WebConvexClient implements IConvexClient {
     // strongly — that's intentional; the JS-side reference keeps the client
     // reachable until the next create() invokes & clears the stash, which
     // is exactly when we want the old client gone.
-    _writeStashedDispose((() {
-      try {
-        client.dispose();
-      } catch (_) {
-        // Swallow — caller's logger may itself be defunct after hot restart.
-      }
-    }).toJS);
+    _writeStashedDispose(
+      (() {
+        try {
+          client.dispose();
+        } catch (_) {
+          // Swallow — caller's logger may itself be defunct after hot restart.
+        }
+      }).toJS,
+    );
 
     // Setup lifecycle observer
     // Note: On web, we don't reconnect on lifecycle events because:
@@ -467,12 +469,17 @@ class WebConvexClient implements IConvexClient {
       // fails (e.g. ArgumentValidationError, application-level ConvexError).
       // The field name varies by Convex protocol version; check all known
       // variants: errorMessage, error_message, errorData, error.
-      final errorMessage =
-          (mod['errorMessage'] ?? mod['error_message']) as String? ??
-          (mod['error'] is String ? mod['error'] as String : null);
-      final errorData =
-          mod['errorData'] as String? ??
-          (mod['error'] is Map ? jsonEncode(mod['error']) : null);
+      //
+      // `errorData` carries the structured `ConvexError.data` payload and
+      // arrives as whatever JS shape the backend threw — a Map for object
+      // payloads, a primitive for primitive payloads, or absent for plain
+      // (non-ConvexError) failures. We JSON-encode it before forwarding so
+      // the consumer always sees a String?. Casting raw to `as String?`
+      // throws a TypeError when the payload is a Map and silently breaks
+      // the subscription (the catch upstream swallows it and onError never
+      // fires, leaving the query stuck in a loading state).
+      final errorMessage = _extractTransitionErrorMessage(mod);
+      final errorData = _extractTransitionErrorData(mod);
 
       if (errorMessage != null) {
         config.logger(
@@ -500,6 +507,36 @@ class WebConvexClient implements IConvexClient {
       final valueJson = jsonEncode(mod['value']);
       subscription.onUpdate(valueJson);
     }
+  }
+
+  /// Extracts a human-readable error message from a Transition modification.
+  /// Coerces non-string payloads with `.toString()` so a Map-valued
+  /// `errorMessage` (seen on some Convex protocol versions) doesn't TypeError.
+  String? _extractTransitionErrorMessage(Map mod) {
+    final direct = mod['errorMessage'] ?? mod['error_message'];
+    if (direct is String) return direct;
+    if (direct != null) return direct.toString();
+    final err = mod['error'];
+    if (err is String) return err;
+    if (err is Map) {
+      final m = err['message'];
+      if (m is String) return m;
+      if (m != null) return m.toString();
+    }
+    return null;
+  }
+
+  /// Extracts the structured `ConvexError.data` payload from a Transition
+  /// modification and returns it as a JSON-encoded String? for the
+  /// downstream `ClientError.convexError(data: ...)` contract. Accepts any
+  /// JS shape the backend threw (Map, primitive, or absent).
+  String? _extractTransitionErrorData(Map mod) {
+    final direct = mod['errorData'];
+    if (direct is String) return direct;
+    if (direct != null) return jsonEncode(direct);
+    final err = mod['error'];
+    if (err is Map) return jsonEncode(err);
+    return null;
   }
 
   /// Handles MutationResponse messages.
